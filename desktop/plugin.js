@@ -1,13 +1,19 @@
 /**
  * AI Usage Tracker — live subscription quota for every AI provider Hermes can
- * route to, per profile, in the Hermes desktop.
+ * route to, across every local profile, in the Hermes desktop.
  *
  * Scope (deliberately narrow): subscription quota windows only — provider,
- * plan, window, % remaining, reset countdown. No token counting, no cost
- * estimates, no time-window filters.
+ * plan, window, % remaining, reset countdown, plus OpenRouter's account
+ * balance and per-key spend. No token counting, no cost estimates, no history.
+ *
+ * All accounts: the page asks each profile's own backend
+ * (`/usage?profile=<name>`, routed by Hermes per profile, so its consent and
+ * secret scope apply) and merges entries only when the backend reports the
+ * same `account.fingerprint` — a confirmed shared account. Unidentified
+ * accounts stay one card per profile; numbers are never added up.
  *
  * Backend: ~/.hermes/plugins/ai-usage-tracker/dashboard/plugin_api.py
- * Read-only. No secrets ever reach the UI.
+ * Read-only. No secrets or raw account identifiers ever reach the UI.
  */
 import {
   Badge,
@@ -40,6 +46,8 @@ const ID = 'ai-usage-tracker'
 const ROUTE = '/ai-usage'
 const REFRESH_PAGE_MS = 120_000
 const REFRESH_CHIP_MS = 300_000
+// One slow profile must not hold the others: each profile's request is bounded on its own.
+const PROFILE_TIMEOUT_MS = 30_000
 
 let rest = null
 let storage = null
@@ -49,35 +57,41 @@ let pendingRefresh = false
 const HIDDEN_KEY = 'hidden-providers-v1'
 const $hidden = atom([])
 
-// Selected profile — plugin-scoped, shared by page and chip. Empty means
-// "whatever this backend runs as".
-const PROFILE_KEY = 'selected-profile-v1'
-const $profile = atom('')
+// Profile filter over the All accounts view. Empty = every account (the default,
+// whichever profile the app itself is on). A new key on purpose: the v1 key held
+// a single-profile selection that would otherwise hide every other account.
+const FILTER_KEY = 'profile-filter-v2'
+const ALL_ACCOUNTS = '__all__'
+const $filter = atom('')
 
 // Which provider the status-bar chip watches. Empty = AUTO: the worst remaining
-// window across every visible provider (the historical default). A provider id
-// pins the chip to that provider's own worst window; the page writes it.
+// window across every visible account. A provider id pins the chip to that
+// provider's own worst window; the page writes it.
 const CHIP_KEY = 'chip-provider-v1'
 const AUTO_CHIP = 'auto'
 const $chipProvider = atom('')
 
+// Fan-out state: `profiles` from the host profile list, `results[name]` as each profile answers,
+// so a fast profile renders while a slow one is still pending.
+const $fanout = atom({ profiles: null, results: {} })
+
+function remember(key, value) {
+  try {
+    storage?.set(key, value)
+  } catch {
+    /* in-memory state still works for this session */
+  }
+}
+
 function selectChipProvider(id) {
   const value = String(id || '')
   $chipProvider.set(value)
-  try {
-    storage?.set(CHIP_KEY, value)
-  } catch {
-    /* in-memory selection still works for this session */
-  }
+  remember(CHIP_KEY, value)
 }
 
 function persistHidden(ids) {
   $hidden.set(ids)
-  try {
-    storage?.set(HIDDEN_KEY, ids)
-  } catch {
-    /* keep the in-memory list when storage is unavailable */
-  }
+  remember(HIDDEN_KEY, ids)
 }
 
 function hideProvider(id) {
@@ -93,29 +107,31 @@ function unhideAll() {
   persistHidden([])
 }
 
-function selectProfile(name) {
-  const value = String(name || '')
-  $profile.set(value)
-  try {
-    storage?.set(PROFILE_KEY, value)
-  } catch {
-    /* in-memory selection still works for this session */
-  }
+function selectFilter(name) {
+  const value = name === ALL_ACCOUNTS ? '' : String(name || '')
+  $filter.set(value)
+  remember(FILTER_KEY, value)
+}
+
+/** The active profile filter ('' = All accounts). */
+export function currentProfileFilter() {
+  return $filter.get()
 }
 
 // ---------------------------------------------------------------- formatters
 
-function fmtIst(iso) {
+/** An ISO instant in the browser's own time zone, with the zone named. */
+export function formatLocalTime(iso) {
   if (!iso) return null
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return d.toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata',
+  return d.toLocaleString(undefined, {
     day: '2-digit',
     month: 'short',
     hour: '2-digit',
     minute: '2-digit',
-    hour12: true
+    hour12: true,
+    timeZoneName: 'short'
   })
 }
 
@@ -129,12 +145,26 @@ function resetLabel(iso) {
   const hours = Math.floor((seconds % 86_400) / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   const rel = days ? `in ${days}d ${hours}h` : hours ? `in ${hours}h ${minutes}m` : `in ${minutes}m`
-  return `resets ${rel} · ${fmtIst(iso)} IST`
+  return `resets ${rel} · ${formatLocalTime(iso)}`
 }
 
 function pct(value) {
   if (value === null || value === undefined) return '—'
   return `${Math.round(Number(value))}%`
+}
+
+function usd(value) {
+  if (value === null || value === undefined) return null
+  return `$${Number(value).toFixed(2)}`
+}
+
+/** A key's spend cap. OpenRouter's `limit: null` is unlimited; `0` is a real $0 cap. */
+export function openRouterKeyLabel(key) {
+  const capped = key.restricted || (key.limit_usd !== null && key.limit_usd !== undefined)
+  if (!capped) return 'unrestricted key (no spend limit)'
+  if (key.limit_usd === null || key.limit_usd === undefined) return 'restricted key'
+  const left = key.limit_remaining_usd === null || key.limit_remaining_usd === undefined ? '' : `, ${usd(key.limit_remaining_usd)} left`
+  return `restricted key · ${usd(key.limit_usd)} cap${left}`
 }
 
 function toneFor(remaining) {
@@ -150,12 +180,71 @@ function statusOf(provider) {
   return { variant: 'muted', label: 'unavailable' }
 }
 
-function profileLabel(row) {
-  if (!row) return 'profile'
-  return `${row.name}${row.is_default ? ' · default' : ''}${row.gateway_running ? ' · up' : ''}`
+function errorText(error) {
+  const text = String(error?.message || error || 'request failed')
+  if (/plugin not found|not enabled in this profile/i.test(text)) {
+    return `${text} — AI usage tracker is not enabled for this profile (hermes --profile <name> plugins enable ai-usage-tracker).`
+  }
+  return text
 }
 
-/** Worst (lowest) remaining percent across visible providers' windows — drives the chip. */
+// ---------------------------------------------------------------- aggregation
+
+function fetchedAt(provider) {
+  const t = Date.parse(provider?.quota?.fetched_at || '')
+  return Number.isNaN(t) ? 0 : t
+}
+
+/**
+ * Merge per-profile `/usage` answers into account cards.
+ *
+ * `results`: `[{ profile, ok: true, payload } | { profile, ok: false, error }]`.
+ * Entries merge only on the same provider family AND the same backend
+ * `account.fingerprint` (a provider-confirmed identity); a missing fingerprint
+ * keeps one card per profile. A merged card shows the freshest single snapshot
+ * and lists every profile using it — percentages and balances are never summed.
+ */
+export function aggregateAccounts(results) {
+  const accounts = []
+  const byKey = new Map()
+  const failures = []
+  for (const result of results || []) {
+    if (!result?.ok) {
+      failures.push({ profile: result?.profile, error: result?.error })
+      continue
+    }
+    for (const provider of result.payload?.providers || []) {
+      const fingerprint = provider.account?.fingerprint || null
+      const family = provider.family || provider.id
+      const key = fingerprint ? `${family}#${fingerprint}` : `${provider.id}@${result.profile}`
+      const existing = byKey.get(key)
+      if (!existing) {
+        const account = { key, provider, profiles: [result.profile], cacheAge: result.payload?.cache_age_seconds ?? null }
+        byKey.set(key, account)
+        accounts.push(account)
+        continue
+      }
+      if (!existing.profiles.includes(result.profile)) existing.profiles.push(result.profile)
+      if (fetchedAt(provider) > fetchedAt(existing.provider)) {
+        existing.provider = provider
+        existing.cacheAge = result.payload?.cache_age_seconds ?? null
+      }
+    }
+  }
+  // Live quota first; within that, stable by label so cards don't jump between refreshes.
+  accounts.sort((a, b) => {
+    const live = Number(Boolean(b.provider.quota?.available)) - Number(Boolean(a.provider.quota?.available))
+    return live || String(a.provider.label).localeCompare(String(b.provider.label))
+  })
+  return { accounts, failures }
+}
+
+/** Accounts a profile uses; '' = all of them. */
+export function filterAccounts(accounts, profile) {
+  if (!profile) return accounts
+  return accounts.filter(account => account.profiles.includes(profile))
+}
+
 /** One provider's tightest numeric window, or null when it reports none. */
 function worstWindowOf(provider) {
   let worst = null
@@ -163,57 +252,86 @@ function worstWindowOf(provider) {
     const remaining = window.remaining_percent
     if (remaining === null || remaining === undefined) continue
     if (worst === null || remaining < worst.remaining) {
-      worst = {
-        remaining,
-        provider: provider.label,
-        window: window.label,
-        reset_at: window.reset_at || null
-      }
+      worst = { remaining, provider: provider.label, window: window.label, reset_at: window.reset_at || null }
     }
   }
   return worst
 }
 
-/** AUTO pick: the tightest window across every provider that isn't hidden. */
-function worstRemaining(payload, hiddenIds) {
-  const hidden = hiddenIds || []
+/** The tightest window across the given accounts (AUTO chip). */
+function worstRemaining(accounts) {
   let worst = null
-  for (const provider of payload?.providers || []) {
-    if (hidden.includes(provider.id)) continue
-    const candidate = worstWindowOf(provider)
+  for (const account of accounts) {
+    const candidate = worstWindowOf(account.provider)
     if (candidate && (worst === null || candidate.remaining < worst.remaining)) worst = candidate
   }
   return worst
 }
 
-// ---------------------------------------------------------------- data hooks
+// ---------------------------------------------------------------- data
 
 function usagePath(profile, refresh) {
-  const params = []
-  if (profile) params.push(`profile=${encodeURIComponent(profile)}`)
+  const params = [`profile=${encodeURIComponent(profile)}`]
   if (refresh) params.push('refresh=1')
-  return params.length ? `/usage?${params.join('&')}` : '/usage'
+  return `/usage?${params.join('&')}`
 }
 
-function useUsage(profile, intervalMs) {
-  return useQuery({
-    queryKey: ['ai-usage-tracker', 'usage', profile || 'server'],
-    queryFn: () => {
-      const refresh = pendingRefresh
-      pendingRefresh = false
-      return rest(usagePath(profile, refresh))
-    },
+/** Every installed profile, read through the host's own profile list so it does not depend on
+ *  the app's selected profile having this plugin enabled. Each profile's /usage call below is
+ *  still routed to that profile, so its own plugin gate and consent apply. */
+async function listProfiles() {
+  const listing = host.profiles?.list ? await host.profiles.list() : await rest('/profiles')
+  const rows = Array.isArray(listing?.profiles) ? listing.profiles : []
+  return rows
+    .filter(row => row && typeof row.name === 'string' && row.name)
+    .map(row => ({ name: row.name, is_default: Boolean(row.is_default) }))
+    .sort((a, b) => Number(b.is_default) - Number(a.is_default) || a.name.localeCompare(b.name))
+}
+
+export async function loadAllAccounts() {
+  const refresh = pendingRefresh
+  pendingRefresh = false
+  const profiles = await listProfiles()
+  const names = profiles.map(row => row.name)
+  // Keep the last answer of every still-listed profile until its new one lands.
+  const previous = $fanout.get().results
+  $fanout.set({ profiles, results: Object.fromEntries(names.filter(n => previous[n]).map(n => [n, previous[n]])) })
+  await Promise.all(
+    names.map(async name => {
+      let result
+      try {
+        result = { profile: name, ok: true, payload: await rest(usagePath(name, refresh), { timeoutMs: PROFILE_TIMEOUT_MS }) }
+      } catch (error) {
+        result = { profile: name, ok: false, error: errorText(error) }
+      }
+      const current = $fanout.get()
+      $fanout.set({ ...current, results: { ...current.results, [name]: result } })
+    })
+  )
+  return { at: new Date().toISOString(), profiles: names.length, results: $fanout.get().results }
+}
+
+function useAllAccounts(intervalMs) {
+  const query = useQuery({
+    queryKey: ['ai-usage-tracker', 'all-accounts'],
+    queryFn: loadAllAccounts,
     refetchInterval: intervalMs,
     refetchOnMount: 'always',
     refetchOnWindowFocus: true,
     staleTime: 30_000,
     retry: 1,
-    // Switching profile must never blank the page or drop the picker.
     placeholderData: previous => previous
   })
+  const fanout = useValue($fanout)
+  const profiles = fanout.profiles || []
+  const ordered = profiles.map(row => fanout.results[row.name]).filter(Boolean)
+  const pending = profiles.filter(row => !fanout.results[row.name]).map(row => row.name)
+  return { ...query, profiles, pending, ...aggregateAccounts(ordered) }
 }
 
 // ---------------------------------------------------------------- components
+
+const MUTED = 'text-[0.6875rem] text-(--ui-text-quaternary)'
 
 function QuotaBar({ window }) {
   const remaining = window.remaining_percent
@@ -259,28 +377,71 @@ function QuotaBar({ window }) {
   })
 }
 
-function ProviderCard({ provider, isHidden }) {
-  const status = statusOf(provider)
-  const windows = provider.quota?.windows || []
-  const details = provider.quota?.details || []
-
+/** OpenRouter: the account's balance and this key's own spend, visibly separate. */
+function OpenRouterBlock({ quota }) {
+  const balance = quota.balance || {}
+  const key = quota.key
+  const keyParts = []
+  if (key) {
+    keyParts.push(openRouterKeyLabel(key))
+    if (key.usage_usd !== null && key.usage_usd !== undefined) keyParts.push(`spent ${usd(key.usage_usd)} total`)
+    for (const [field, label] of [['usage_daily_usd', 'today'], ['usage_weekly_usd', 'this week'], ['usage_monthly_usd', 'this month']]) {
+      if (key[field]) keyParts.push(`${usd(key[field])} ${label}`)
+    }
+  }
   return jsxs('div', {
-    className: cn(
-      'flex flex-col gap-2 rounded-[5px] border border-(--ui-stroke-secondary) p-3',
-      isHidden && 'opacity-60'
-    ),
+    className: 'flex flex-col gap-1 text-xs',
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        className: 'flex flex-wrap items-baseline gap-2',
+        children: [
+          jsx('span', { className: 'w-28 shrink-0 text-(--ui-text-tertiary)', children: 'Account balance' }),
+          jsx('span', {
+            className: 'font-medium tabular-nums text-(--ui-text-secondary)',
+            children: balance.remaining_usd === null || balance.remaining_usd === undefined ? '—' : usd(balance.remaining_usd)
+          }),
+          jsx('span', {
+            className: 'text-(--ui-text-quaternary)',
+            children: balance.error
+              ? `balance unavailable: ${balance.error}`
+              : 'whole OpenRouter account — every key on it reports this same balance; never added up'
+          })
+        ]
+      }),
+      key
+        ? jsxs('div', {
+            className: 'flex flex-wrap items-baseline gap-2',
+            children: [
+              jsx('span', { className: 'w-28 shrink-0 text-(--ui-text-tertiary)', children: 'This API key' }),
+              jsx('span', { className: 'text-(--ui-text-secondary)', children: keyParts.join(' · ') })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function AccountCard({ account, isHidden }) {
+  const provider = account.provider
+  const quota = provider.quota || {}
+  const status = statusOf(provider)
+  const fetched = quota.fetched_at ? formatLocalTime(quota.fetched_at) : null
+  const freshness = fetched
+    ? `fetched ${fetched}${account.cacheAge ? ` (cached ${Math.round(account.cacheAge)}s)` : ''}`
+    : null
+  const unconfirmed = quota.available && !provider.account?.fingerprint
+
+  return jsxs('div', {
+    'data-account': provider.family || provider.id,
+    className: cn('flex flex-col gap-2 rounded-[5px] border border-(--ui-stroke-secondary) p-3', isHidden && 'opacity-60'),
+    children: [
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-2',
         children: [
           jsx('span', { className: 'text-sm font-medium', children: provider.label }),
-          provider.quota?.plan
-            ? jsx(Badge, { variant: 'muted', size: 'xs', children: provider.quota.plan })
-            : null,
+          quota.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: quota.plan }) : null,
           jsx(Badge, { variant: status.variant, size: 'xs', children: status.label }),
-          provider.active
-            ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'used recently' })
-            : null,
+          ...account.profiles.map(name => jsx(Badge, { variant: 'outline', size: 'xs', children: name }, `p-${name}`)),
           jsx('span', { className: 'flex-1' }),
           jsx('button', {
             type: 'button',
@@ -296,38 +457,48 @@ function ProviderCard({ provider, isHidden }) {
           })
         ]
       }),
-      windows.map((window, index) => jsx(QuotaBar, { window }, index)),
-      !provider.quota?.available && provider.quota?.unavailable_reason
-        ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: provider.quota.unavailable_reason })
-        : null,
-      details.map((detail, index) =>
-        jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: detail }, index)
-      )
+      quota.balance || quota.key ? jsx(OpenRouterBlock, { quota }) : null,
+      (quota.windows || []).map((window, index) => jsx(QuotaBar, { window }, index)),
+      !quota.available && quota.unavailable_reason ? jsx('div', { className: MUTED, children: quota.unavailable_reason }) : null,
+      (quota.details || []).map((detail, index) => jsx('div', { className: MUTED, children: detail }, index)),
+      freshness || unconfirmed
+        ? jsx('div', {
+            className: MUTED,
+            children: [freshness, unconfirmed ? 'account identity not confirmable — shown per profile, never merged' : null]
+              .filter(Boolean)
+              .join(' · ')
+          })
+        : null
     ]
   })
 }
 
-function ProfilePicker({ profiles, value, onSelect }) {
-  if (!profiles.length) return null
+function FilterPicker({ profiles, value, onSelect }) {
   return jsxs(Select, {
-    value: value || undefined,
-    onValueChange: onSelect,
+    value: value || ALL_ACCOUNTS,
+    onValueChange: next => {
+      haptic('tap')
+      onSelect(next)
+    },
     children: [
       jsx(SelectTrigger, {
         className: 'h-6 w-44 text-[0.6875rem]',
-        'aria-label': 'Hermes profile',
-        children: jsx(SelectValue, { placeholder: 'profile…' })
+        'aria-label': 'Filter by Hermes profile',
+        children: jsx(SelectValue, {})
       }),
       jsx(SelectContent, {
-        children: profiles.map(row => jsx(SelectItem, { value: row.name, children: profileLabel(row) }, row.name))
+        children: [
+          jsx(SelectItem, { value: ALL_ACCOUNTS, children: 'All accounts' }, ALL_ACCOUNTS),
+          ...profiles.map(row =>
+            jsx(SelectItem, { value: row.name, children: row.is_default && row.name !== 'default' ? `${row.name} (default)` : row.name }, row.name)
+          )
+        ]
       })
     ]
   })
 }
 
-/** Picks which provider the status-bar chip watches. AUTO_CHIP keeps the
- *  historical behaviour (worst window across all visible providers); hidden
- *  providers aren't offered because the chip skips them either way. */
+/** Picks which provider the status-bar chip watches. AUTO_CHIP = worst window across visible accounts. */
 function ChipPicker({ providers, value, onSelect }) {
   return jsxs(Select, {
     value: value || AUTO_CHIP,
@@ -345,24 +516,19 @@ function ChipPicker({ providers, value, onSelect }) {
       jsx(SelectContent, {
         children: [
           jsx(SelectItem, { value: AUTO_CHIP, children: 'Auto (Lowest %)' }, AUTO_CHIP),
-          ...providers.map(provider =>
-            jsx(SelectItem, { value: provider.id, children: provider.label }, provider.id)
-          )
+          ...providers.map(provider => jsx(SelectItem, { value: provider.id, children: provider.label }, provider.id))
         ]
       })
     ]
   })
 }
 
-function PageHeader({ profiles, profile, setProfile, chipProviders, chipProvider, setChipProvider, isFetching, refetch, meta, hiddenCount, showHidden, setShowHidden }) {
+function PageHeader({ profiles, filter, chipProviders, chipProvider, isFetching, refetch, meta, hiddenCount, showHidden, setShowHidden }) {
   return jsxs('div', {
     className: 'flex flex-wrap items-center gap-2',
     children: [
-      jsx('span', { className: 'text-sm font-medium', children: 'AI usage' }),
-      jsx('span', {
-        className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-        children: meta || ''
-      }),
+      jsx('span', { className: 'text-sm font-medium', children: filter ? `AI usage · ${filter}` : 'AI usage · All accounts' }),
+      jsx('span', { className: MUTED, children: meta || '' }),
       jsx('span', { className: 'flex-1' }),
       hiddenCount > 0
         ? jsxs(Button, {
@@ -372,10 +538,7 @@ function PageHeader({ profiles, profile, setProfile, chipProviders, chipProvider
               haptic('tap')
               setShowHidden(!showHidden)
             },
-            children: [
-              jsx(Codicon, { name: 'eye' }),
-              jsx('span', { children: showHidden ? `Showing hidden ${hiddenCount}` : `Hidden ${hiddenCount}` })
-            ]
+            children: [jsx(Codicon, { name: 'eye' }), jsx('span', { children: showHidden ? `Showing hidden ${hiddenCount}` : `Hidden ${hiddenCount}` })]
           })
         : null,
       showHidden && hiddenCount > 0
@@ -388,9 +551,9 @@ function PageHeader({ profiles, profile, setProfile, chipProviders, chipProvider
             children: 'Unhide all'
           })
         : null,
-      jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'Status Bar:' }),
-      jsx(ChipPicker, { providers: chipProviders, value: chipProvider, onSelect: setChipProvider }),
-      jsx(ProfilePicker, { profiles, value: profile, onSelect: setProfile }),
+      jsx('span', { className: MUTED, children: 'Status Bar:' }),
+      jsx(ChipPicker, { providers: chipProviders, value: chipProvider, onSelect: selectChipProvider }),
+      jsx(FilterPicker, { profiles, value: filter, onSelect: selectFilter }),
       jsxs(Button, {
         variant: 'secondary',
         onClick: () => {
@@ -408,57 +571,51 @@ function PageHeader({ profiles, profile, setProfile, chipProviders, chipProvider
 function UsagePage() {
   const [showHidden, setShowHidden] = useState(false)
   const hiddenIds = useValue($hidden)
-  const selected = useValue($profile)
-  const { data, error, isFetching, refetch } = useUsage(selected, REFRESH_PAGE_MS)
-
+  const filter = useValue($filter)
   const chipProvider = useValue($chipProvider)
-  const profiles = data?.profiles || []
-  const shownProfile = selected || data?.profile || ''
+  const { data, error, isFetching, refetch, profiles, pending, accounts, failures } = useAllAccounts(REFRESH_PAGE_MS)
+
+  const inView = filterAccounts(accounts, filter)
+  const visible = inView.filter(account => !hiddenIds.includes(account.provider.id))
+  const hiddenAccounts = inView.filter(account => hiddenIds.includes(account.provider.id))
+  const chipProviders = [...new Map(visible.map(a => [a.provider.id, a.provider])).values()]
   const header = jsx(PageHeader, {
     profiles,
-    profile: shownProfile,
-    setProfile: selectProfile,
-    chipProviders: (data?.providers || []).filter(provider => !hiddenIds.includes(provider.id)),
+    filter,
+    chipProviders,
     chipProvider,
-    setChipProvider: selectChipProvider,
     isFetching,
     refetch,
     hiddenCount: hiddenIds.length,
     showHidden,
     setShowHidden,
-    meta: data ? `fetched ${fmtIst(data.generated_at)} IST · probed in ${data.probe_seconds}s` : null
+    meta: data ? `refreshed ${formatLocalTime(data.at)}` : null
   })
 
-  // The header (profile picker + refresh) renders in EVERY state.
-  if (error && !data) {
+  // The header (filter + refresh) renders in EVERY state.
+  if (error && !profiles.length) {
     return jsxs('div', {
       className: 'flex flex-col gap-3 p-4',
       children: [
         header,
         jsx(ErrorState, {
           title: 'Could not load usage',
-          description: `${error?.message || error} — a "Plugin not found" here means the backend is not enabled for this profile (hermes --profile <name> plugins enable ai-usage-tracker, then relaunch the app).`,
+          description: `${errorText(error)}`,
           children: jsx(Button, { variant: 'secondary', onClick: () => refetch(), children: 'Retry' })
         })
       ]
     })
   }
-  if (!data) {
+  if (!profiles.length || (!accounts.length && pending.length)) {
     return jsxs('div', {
       className: 'flex flex-col gap-3 p-4',
-      children: [
-        header,
-        jsx(Skeleton, { className: 'h-6 w-48' }),
-        jsx(Skeleton, { className: 'h-24 w-full' }),
-        jsx(Skeleton, { className: 'h-24 w-full' })
-      ]
+      children: [header, jsx(Skeleton, { className: 'h-6 w-48' }), jsx(Skeleton, { className: 'h-24 w-full' }), jsx(Skeleton, { className: 'h-24 w-full' })]
     })
   }
 
-  const providers = data.providers || []
-  const visible = providers.filter(provider => !hiddenIds.includes(provider.id))
-  const hiddenProviders = providers.filter(provider => hiddenIds.includes(provider.id))
-  const live = visible.filter(provider => provider.quota?.available).length
+  const live = visible.filter(account => account.provider.quota?.available).length
+  const answered = profiles.length - pending.length - failures.length
+  const shownFailures = failures.filter(f => !filter || f.profile === filter)
 
   return jsxs(ScrollArea, {
     className: 'h-full',
@@ -466,48 +623,42 @@ function UsagePage() {
       className: 'flex flex-col gap-3 p-4',
       children: [
         header,
-        error && data
-          ? jsx('div', {
-              className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-              children: `Showing the last good response — the refresh failed: ${error?.message || error}`
-            })
-          : null,
-        // A backend started before this plugin version still serves the old
-        // payload shape (no per-profile data) — say so instead of silently
-        // rendering a page with no picker.
-        data.profiles
-          ? null
-          : jsx('div', {
-              className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-              children: 'This backend is running an older copy of the plugin (no per-profile data), so the profile picker is hidden — quit and relaunch the Hermes desktop app to load the current backend.'
-            }),
+        error ? jsx('div', { className: MUTED, children: `Showing the last good answers — the refresh failed: ${errorText(error)}` }) : null,
         jsx('div', {
-          className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-          children: profiles.length > 1
-            ? `${providers.length} provider(s) in ${shownProfile || 'this profile'} · ${live} reporting live quota · switch profile above to inspect another`
-            : `${providers.length} provider(s) · ${live} reporting live quota`
+          className: MUTED,
+          children: `${visible.length} account(s) · ${live} reporting live quota · ${answered}/${profiles.length} profiles answered` +
+            (filter ? ` · filtered to ${filter}` : ' · shared subscriptions are listed once with every profile using them')
         }),
+        pending.length
+          ? jsx('div', { className: MUTED, children: `Still waiting on: ${pending.join(', ')}` })
+          : null,
+        ...shownFailures.map(failure =>
+          jsx('div', {
+            role: 'alert',
+            className: 'rounded-[5px] border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-secondary)',
+            children: `Profile ${failure.profile}: ${failure.error} — other profiles are unaffected.`
+          }, `fail-${failure.profile}`)
+        ),
         jsx(Separator, {}),
         jsxs('div', {
           className: 'flex flex-col gap-2',
           children: [
-            visible.map((provider, index) => jsx(ProviderCard, { provider }, index)),
-            showHidden
-              ? hiddenProviders.map((provider, index) => jsx(ProviderCard, { provider, isHidden: true }, `hidden-${index}`))
-              : null,
+            visible.map(account => jsx(AccountCard, { account }, account.key)),
+            showHidden ? hiddenAccounts.map(account => jsx(AccountCard, { account, isHidden: true }, `hidden-${account.key}`)) : null,
             visible.length === 0
               ? jsx(EmptyState, {
-                  title: providers.length ? 'Every provider is hidden' : 'No providers to show',
-                  description: providers.length
-                    ? `Use "Hidden ${hiddenProviders.length}" above to bring them back.`
-                    : 'This profile has no provider credentials and no recent usage.'
+                  title: inView.length ? 'Every provider is hidden' : 'No accounts to show',
+                  description: inView.length
+                    ? `Use "Hidden ${hiddenIds.length}" above to bring them back.`
+                    : 'No profile reported provider credentials or recent usage.'
                 })
               : null
           ]
         }),
         jsx('div', {
-          className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-          children: '✕ on a card hides that provider (persisted, and excluded from the status-bar chip) · quota comes from each provider\'s own API using this profile\'s credentials.'
+          className: MUTED,
+          children:
+            '✕ on a card hides that provider (persisted, and excluded from the status-bar chip) · quota comes from each provider\'s own API using each profile\'s own credentials · times are in this browser\'s time zone.'
         })
       ]
     })
@@ -516,21 +667,18 @@ function UsagePage() {
 
 function UsageChip() {
   const hiddenIds = useValue($hidden)
-  const selected = useValue($profile)
+  const filter = useValue($filter)
   const pinnedId = useValue($chipProvider)
-  const { data } = useUsage(selected, REFRESH_CHIP_MS)
+  const { data, accounts } = useAllAccounts(REFRESH_CHIP_MS)
 
-  // A pin only wins while it resolves to a visible provider with a numeric
-  // window; hidden, absent for this profile, or quota-less falls back to AUTO
-  // instead of blanking the chip.
-  const visible = (data?.providers || []).filter(provider => !(hiddenIds || []).includes(provider.id))
-  const pinned = pinnedId ? visible.find(provider => provider.id === pinnedId) : null
-  const worst = (pinned ? worstWindowOf(pinned) : null) || worstRemaining(data, hiddenIds)
+  // A pin only wins while it resolves to a visible account with a numeric window;
+  // otherwise the chip falls back to AUTO instead of blanking.
+  const visible = filterAccounts(accounts, filter).filter(account => !(hiddenIds || []).includes(account.provider.id))
+  const pinned = pinnedId ? worstRemaining(visible.filter(account => account.provider.id === pinnedId)) : null
+  const worst = pinned || worstRemaining(visible)
   const tone = toneFor(worst ? worst.remaining : null)
   const detail = worst
-    ? [worst.provider, worst.window ? `${worst.window} window` : null, resetLabel(worst.reset_at)]
-        .filter(Boolean)
-        .join(' · ')
+    ? [worst.provider, worst.window ? `${worst.window} window` : null, resetLabel(worst.reset_at)].filter(Boolean).join(' · ')
     : 'AI usage'
 
   return jsx('button', {
@@ -549,12 +697,7 @@ function UsageChip() {
           'aria-hidden': true,
           className: 'inline-block size-1.5 rounded-full',
           style: {
-            background:
-              tone === 'bad'
-                ? 'var(--ui-accent)'
-                : tone === 'warn'
-                  ? 'var(--ui-text-secondary)'
-                  : 'var(--ui-text-quaternary)'
+            background: tone === 'bad' ? 'var(--ui-accent)' : tone === 'warn' ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)'
           }
         }),
         jsx('span', { children: worst ? `${pct(worst.remaining)} · ${worst.provider}` : data ? 'AI usage' : 'AI usage…' })
@@ -582,16 +725,11 @@ export default {
       /* fall through to AUTO */
     }
     try {
-      const savedProfile = storage?.get(PROFILE_KEY, '')
-      if (typeof savedProfile === 'string' && savedProfile) {
-        $profile.set(savedProfile)
-      } else {
-        // First run: default to the profile the app itself is on.
-        const active = host.state.profile?.get?.()
-        if (typeof active === 'string' && active) $profile.set(active)
-      }
+      // All accounts unless this browser chose a filter — never the app's active profile.
+      const savedFilter = storage?.get(FILTER_KEY, '')
+      $filter.set(typeof savedFilter === 'string' ? savedFilter : '')
     } catch {
-      /* fall through to the backend's own profile */
+      $filter.set('')
     }
 
     ctx.register({

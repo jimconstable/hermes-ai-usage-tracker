@@ -12,10 +12,20 @@ Every probe runs with the *target profile's* ``HERMES_HOME`` bound through
 request can resolve another profile's credentials without touching the server's
 own. Secrets are resolved in-process and never serialized: the wire carries
 ``configured``/``source`` labels only.
+
+The desktop page's *All accounts* view asks each profile separately
+(``/usage?profile=<name>``), so Hermes' own per-profile routing, plugin consent and
+secret scope decide every request; this backend never reaches across profiles on
+its own. To let the page show a shared subscription once, each provider entry
+carries ``account.fingerprint``: a truncated one-way hash of an identity the
+provider itself confirms (a Codex JWT principal, an OpenRouter API key), or
+``null`` when the account cannot be identified — those are never merged.
 """
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import logging
 import os
 import sqlite3
@@ -98,7 +108,7 @@ def _run_in_home(home: Optional[Path], fn: Callable[[], Any]) -> Any:
     The override lives in a ContextVar, so it is thread-local: a request can
     resolve another profile's credentials/state without disturbing the server's
     own profile (and ThreadPoolExecutor workers do NOT inherit the caller's
-    context, so every worker binds it itself).
+    context, so every worker runs in a copy of it and binds the home itself).
     """
     if home is None:
         return fn()
@@ -289,6 +299,18 @@ def _get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
         return response.json() or {}
 
 
+def _fingerprint(kind: str, value: Optional[str]) -> Optional[str]:
+    """Opaque account token: equal across profiles for the same identity, never the identity.
+
+    A truncated SHA-256 over a domain-separated string — enough to compare two entries on one
+    machine, not enough to recover an account id or key. ``None`` in, ``None`` out.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return hashlib.sha256(f"ai-usage-tracker/v1/{kind}/{text}".encode("utf-8")).hexdigest()[:16]
+
+
 def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
     windows = []
     for window in getattr(snapshot, "windows", ()) or ():
@@ -309,16 +331,134 @@ def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
         "details": [str(d) for d in (getattr(snapshot, "details", ()) or ())],
         "unavailable_reason": getattr(snapshot, "unavailable_reason", None),
         "fetched_at": _iso(getattr(snapshot, "fetched_at", None)),
+        # Popped into ``account`` by _build_payload; the identity itself never leaves this process.
+        "_fingerprint": _fingerprint(str(getattr(snapshot, "provider", "") or ""), getattr(snapshot, "identity", None)),
     }
 
 
 def _probe_standard(provider: str) -> dict[str, Any]:
     from agent.account_usage import fetch_account_usage
 
-    snapshot = fetch_account_usage(provider)
+    # Codex: the read-only variant reports a rejected token instead of refreshing/rotating it —
+    # the All accounts view probes several profiles at once and must never race a credential.
+    snapshot = fetch_account_usage(provider, read_only=provider == "openai-codex")
     if snapshot is None:
-        return _unavailable("No credentials for this provider in this profile.", source="usage_api")
+        return _unavailable("No usage returned: no credentials in this profile, or the provider request failed.",
+                            source="usage_api")
     return _serialize_snapshot(snapshot)
+
+
+def _probe_native(provider: str) -> Optional[dict[str, Any]]:
+    """A provider plugin's own ``fetch_account_usage`` hook (e.g. Claude Subscription DirectSDK,
+    which asks Claude Code for its plan limits — no inference, no token handling here), found
+    through Hermes' provider discovery for the bound profile. ``None`` = no hook / no answer."""
+    from agent.account_usage import fetch_account_usage
+
+    snapshot = fetch_account_usage(provider)
+    return None if snapshot is None else _serialize_snapshot(snapshot)
+
+
+def _native_label(provider: str) -> Optional[str]:
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+    except Exception:  # noqa: BLE001 - discovery failure just means no friendly label
+        return None
+    label = str(getattr(profile, "display_name", "") or "").strip() if profile else ""
+    return label or None
+
+
+# --------------------------------------------------------------------------
+# OpenRouter: account balance and per-key spend, kept apart
+# --------------------------------------------------------------------------
+
+
+def _usd(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _openrouter_named_providers(config: dict[str, Any]) -> list[str]:
+    """Named ``providers:`` entries that point at openrouter.ai (e.g. a restricted fallback key)."""
+    names = []
+    for name, entry in (config.get("providers") or {}).items():
+        base = str((entry or {}).get("base_url") or "") if isinstance(entry, dict) else ""
+        host = base.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+        if host == "openrouter.ai" or host.endswith(".openrouter.ai"):
+            names.append(str(name))
+    return sorted(names)
+
+
+def _probe_openrouter(source: str) -> dict[str, Any]:
+    """One OpenRouter API key: the *account's* credit balance and *this key's* spend/limit.
+
+    The balance belongs to the OpenRouter account, so every key on that account reports the
+    same number — the page shows it per key and never adds balances up. Spend and limit are
+    the key's own (``/key``); a key with a spend limit is ``restricted``.
+    """
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested=source) or {}
+    except Exception as exc:  # noqa: BLE001 - missing creds are a normal state
+        log.debug("openrouter runtime resolution failed for %s", source, exc_info=True)
+        return _unavailable(f"No OpenRouter API key for {source!r} in this profile ({type(exc).__name__}).",
+                            source="openrouter_api")
+    key = str(runtime.get("api_key") or "").strip()
+    if not key:
+        return _unavailable(f"No OpenRouter API key for {source!r} in this profile.", source="openrouter_api")
+    base = str(runtime.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/")
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+
+    def _data(client: httpx.Client, path: str) -> tuple[dict[str, Any], Optional[str]]:
+        try:
+            response = client.get(f"{base}/{path}", headers=headers)
+            if response.status_code in (401, 403):
+                return {}, f"HTTP {response.status_code} — key rejected or not allowed to read /{path}"
+            response.raise_for_status()
+            return (response.json() or {}).get("data") or {}, None
+        except Exception as exc:  # noqa: BLE001 - one half failing keeps the other
+            return {}, f"{type(exc).__name__}: {exc}"
+
+    with httpx.Client(timeout=_PROBE_TIMEOUT) as client:
+        credits, credits_error = _data(client, "credits")
+        key_data, key_error = _data(client, "key")
+    if credits_error and key_error:
+        return _unavailable(f"OpenRouter probe failed: {credits_error}", source="openrouter_api")
+
+    total, spent = _usd(credits.get("total_credits")), _usd(credits.get("total_usage"))
+    balance = {
+        "remaining_usd": None if total is None or spent is None else round(max(0.0, total - spent), 4),
+        "total_credits_usd": total,
+        "total_usage_usd": spent,
+        "error": credits_error,
+    }
+    limit, limit_remaining = _usd(key_data.get("limit")), _usd(key_data.get("limit_remaining"))
+    reset = str(key_data.get("limit_reset") or "").strip() or None
+    key_info = {
+        # OpenRouter documents null as unlimited; 0 is a real $0 cap.
+        "restricted": limit is not None,
+        "limit_usd": limit,
+        "limit_remaining_usd": limit_remaining,
+        "limit_reset": reset,
+        "usage_usd": _usd(key_data.get("usage")),
+        "usage_daily_usd": _usd(key_data.get("usage_daily")),
+        "usage_weekly_usd": _usd(key_data.get("usage_weekly")),
+        "usage_monthly_usd": _usd(key_data.get("usage_monthly")),
+    }
+    windows = []
+    if limit is not None and limit_remaining is not None and 0 <= limit_remaining <= limit:
+        used = (limit - limit_remaining) / limit * 100.0 if limit > 0 else 100.0
+        windows.append(_window("Key spend limit", used, None,
+                               f"${limit_remaining:,.2f} of ${limit:,.2f} left" + (f" · resets {reset}" if reset else "")))
+    details = [f"Key details unavailable: {key_error}"] if key_error else []
+    return {"available": True, "source": "openrouter_api", "title": "OpenRouter", "plan": None,
+            "windows": windows, "details": details, "unavailable_reason": None,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "balance": balance, "key": None if key_error else key_info,
+            "_fingerprint": _fingerprint("openrouter-key", key)}
 
 
 def _probe_nous() -> dict[str, Any]:
@@ -330,7 +470,7 @@ def _probe_nous() -> dict[str, Any]:
         return get_nous_portal_account_info(force_fresh=True)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        info = pool.submit(_fetch).result(timeout=_PROBE_TIMEOUT)
+        info = pool.submit(contextvars.copy_context().run, _fetch).result(timeout=_PROBE_TIMEOUT)
     snapshot = build_nous_credits_snapshot(info)
     if snapshot is None:
         return _unavailable("Not signed in to Nous Portal, or the portal returned no subscription data.",
@@ -604,7 +744,7 @@ def _probe_deepseek() -> dict[str, Any]:
 _PROBES: dict[str, Callable[[], dict[str, Any]]] = {
     "anthropic": lambda: _probe_standard("anthropic"),
     "openai-codex": lambda: _probe_standard("openai-codex"),
-    "openrouter": lambda: _probe_standard("openrouter"),
+    "openrouter": lambda: _probe_openrouter("openrouter"),
     "nous": _probe_nous,
     "copilot": _probe_copilot,
     "opencode-go": _probe_opencode_go,
@@ -652,20 +792,55 @@ def _configured_providers() -> set[str]:
 # --------------------------------------------------------------------------
 
 
+def _profile_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        return config if isinstance(config, dict) else {}
+    except Exception:  # noqa: BLE001 - an unreadable config just adds nothing
+        log.debug("config read failed", exc_info=True)
+        return {}
+
+
+def _model_providers(config: dict[str, Any]) -> set[str]:
+    """Providers the profile's own config routes to: main model, fallback model(s)."""
+    found: set[str] = set()
+    entries = [config.get("model"), config.get("fallback_model"), *(config.get("fallback_providers") or [])]
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("provider"):
+            pid = _normalize_provider(str(entry["provider"]))
+            if pid not in ("unattributed", "auto"):
+                found.add(pid)
+    return found
+
+
 def _build_payload(home: Optional[Path], profile_name: Optional[str]) -> dict[str, Any]:
     started = time.time()
     labels = _provider_labels()
     active, last_seen = _run_in_home(home, _active_providers)
     configured = _run_in_home(home, _configured_providers)
+    config = _run_in_home(home, _profile_config)
+    openrouter_named = set(_openrouter_named_providers(config))
+    configured |= _model_providers(config) | openrouter_named
 
-    targets = sorted((active | configured) & _QUOTA_CAPABLE)
-    probes: dict[str, dict[str, Any]] = {}
-    if targets:
-        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(targets))) as pool:
-            futures = {
-                pool.submit(_run_in_home, home, _PROBES[pid]): pid
-                for pid in targets
-            }
+    candidates = active | configured
+    probes: dict[str, Optional[dict[str, Any]]] = {}
+
+    def _probe_for(pid: str) -> Callable[[], Optional[dict[str, Any]]]:
+        if pid in openrouter_named:
+            return lambda: _probe_openrouter(pid)
+        if pid in _QUOTA_CAPABLE:
+            return _PROBES[pid]
+        # Anything else may be a provider plugin with its own usage hook (Claude DirectSDK).
+        return lambda: _probe_native(pid)
+
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(candidates))) as pool:
+            # Workers don't inherit the request's ContextVars; each gets a copy so the secret scope
+            # Hermes bound for this request still applies (it fails closed without one).
+            futures = {pool.submit(contextvars.copy_context().run, _run_in_home, home, _probe_for(pid)): pid
+                       for pid in sorted(candidates)}
             for future in as_completed(futures):
                 pid = futures[future]
                 try:
@@ -674,23 +849,35 @@ def _build_payload(home: Optional[Path], profile_name: Optional[str]) -> dict[st
                     log.debug("quota probe failed for %s", pid, exc_info=True)
                     probes[pid] = _unavailable(f"Probe failed: {type(exc).__name__}: {exc}")
 
-    names = sorted(active | configured, key=lambda pid: labels.get(pid, pid).lower())
+    def _label(pid: str) -> str:
+        if pid in openrouter_named:
+            return f"{labels.get('openrouter', 'OpenRouter')} · {pid}"
+        if pid in labels:
+            return labels[pid]
+        native = _run_in_home(home, lambda: _native_label(pid)) if probes.get(pid) is not None else None
+        return native or pid.replace("-", " ").title()
+
     providers = []
-    for pid in names:
+    for pid in candidates:
         quota = probes.get(pid) or _unavailable(
             "No public subscription-quota API for this provider." if pid in labels
             else "Provider not in the Hermes catalog.",
             source="none",
         )
+        fingerprint = quota.pop("_fingerprint", None)
         providers.append({
             "id": pid,
-            "label": labels.get(pid, pid.replace("-", " ").title()),
+            # Entries of one family compare by ``account.fingerprint`` (e.g. several OpenRouter keys).
+            "family": "openrouter" if pid in openrouter_named else pid,
+            "label": _label(pid),
             "configured": pid in configured,
-            "quota_capable": pid in _QUOTA_CAPABLE,
+            "quota_capable": pid in _QUOTA_CAPABLE or pid in openrouter_named or probes.get(pid) is not None,
             "active": pid in active,
             "last_active_at": last_seen.get(pid),
+            "account": {"fingerprint": fingerprint},
             "quota": quota,
         })
+    providers.sort(key=lambda row: row["label"].lower())
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

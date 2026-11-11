@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install backend test dependencies
+        run: python -m pip install -r tests/requirements.txt
+      - name: Backend (FastAPI router against fake Hermes host seams)
+        run: python -m pytest -q tests
+      - name: Desktop plugin logic (aggregation, filter, local time)
+        run: node --import ./tests/js/register.mjs --test tests/js/*.test.mjs

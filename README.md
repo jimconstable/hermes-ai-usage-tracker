@@ -2,7 +2,7 @@
 
 Live **subscription quota** for every AI provider Hermes can route to, inside the Hermes
 desktop: a page (sidebar → *AI usage*), a status-bar chip showing the worst remaining
-window, and a per-profile picker.
+window, across every local profile (*All accounts*) with a per-profile filter.
 
 Scope is deliberately narrow: **quota windows only** — provider, plan, window name,
 % remaining, reset countdown. No token counting, no cost estimates, no period filters.
@@ -12,7 +12,8 @@ Scope is deliberately narrow: **quota windows only** — provider, plan, window 
 | `openai-codex` | `chatgpt.com/backend-api/wham/usage` (session + weekly windows) |
 | `anthropic` | `api.anthropic.com/api/oauth/usage` (OAuth accounts only) |
 | `nous` | portal account (subscription credits + renewal) |
-| `openrouter` | `api/v1/credits` + `/key` (balance / key limit) |
+| `openrouter` | `api/v1/credits` + `/key` (account balance / per-key spend + limit) |
+| `claude-subscription-directsdk-experimental` | the provider plugin's own `fetch_account_usage` hook (Claude Code `get_usage`) |
 | `copilot` | `api.github.com/copilot_internal/user` |
 | `opencode-go` | `opencode.ai/zen/go/v1/usage` (rolling / weekly / monthly) |
 | `opencode-zen` | credits endpoint (pay-as-you-go) |
@@ -53,13 +54,31 @@ done
 
 Relaunch the desktop app after enabling (backend routes mount at web-server start).
 
-## Profiles
+## All accounts
 
-The header picker lists **every profile on this machine** and probes the selected one:
-``GET /usage?profile=<name>`` runs the quota probes with that profile's `HERMES_HOME`
-bound through `hermes_constants`' context-local override, so credentials, `auth.json`
-and `.env` resolve for that profile — not the server's own. The chip follows the same
-selection, and the choice is persisted plugin-scoped.
+The page opens on **All accounts** — every local profile's accounts at once, whichever
+profile the app itself is on. It asks each profile separately (``GET /usage?profile=<name>``),
+so Hermes routes every request through that profile's own plugin gate, plugin host and
+secret scope; a profile that has not enabled the plugin shows a one-line notice and the
+rest of the page still renders. Each probe runs with that profile's `HERMES_HOME`, so
+credentials, `auth.json` and `.env` resolve for that profile — not the server's own.
+
+- **Shared subscriptions appear once**, labelled with every profile that uses them — but only
+  when the provider confirms the identity: each entry carries `account.fingerprint`, a
+  truncated one-way hash of the Codex JWT principal or the OpenRouter API key. Accounts with
+  no confirmable identity (e.g. Claude via Claude Code) stay one card per profile. Nothing is
+  merged because two cards share a provider or show the same numbers, and nothing is summed.
+- **OpenRouter** shows the *account* credit balance separately from *this key's* spend and
+  limit. Every key on one OpenRouter account reports the same balance, so it is shown per key
+  and never added up; a restricted (spend-limited) key and an unrestricted key stay separate
+  cards. Named `providers:` entries pointing at openrouter.ai (e.g. a restricted fallback key)
+  are probed as their own keys.
+- **Claude Subscription DirectSDK** (and any provider plugin with a `fetch_account_usage` hook)
+  is read through the provider's own hook, found by Hermes' provider discovery for that
+  profile — the DirectSDK hook asks Claude Code for its plan limits, with no inference and
+  without this plugin ever seeing a token.
+- The **profile filter** (header) narrows the view to the accounts one profile uses; the choice
+  is stored per browser (`profile-filter-v2`). Times are shown in the browser's time zone.
 
 Honest limits:
 
@@ -95,7 +114,21 @@ Responses are cached in-process for 60s per profile; `refresh=1` bypasses.
 
 ## Privacy
 
-- Read-only. Nothing is written except the plugin's own cache and the two UI prefs.
+- Read-only. Nothing is written except the plugin's own cache and its browser-side UI prefs.
 - Credentials are resolved in-process and **never serialized**; the wire carries
-  `configured: true/false` and a source label only.
+  `configured: true/false` and a source label only. Account identities never leave the
+  backend either — only the truncated `account.fingerprint` hash used to recognise a
+  shared account.
 - The only outbound calls are the provider quota endpoints above.
+
+## Tests
+
+```bash
+python -m pip install -r tests/requirements.txt
+python -m pytest -q tests                                       # backend, via the FastAPI router
+node --import ./tests/js/register.mjs --test tests/js/*.test.mjs  # page logic (Node 22)
+```
+
+`tests/e2e/` holds an optional local browser demo: `run.sh` starts a throwaway Hermes gateway
+(clean env, its own `HOME`/`HERMES_HOME`) serving the real Webapp with FIXTURE profiles and a
+fixture network, so the page can be exercised end to end without touching real accounts.
