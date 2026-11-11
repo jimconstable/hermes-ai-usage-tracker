@@ -71,7 +71,7 @@ const CHIP_KEY = 'chip-provider-v1'
 const AUTO_CHIP = 'auto'
 const $chipProvider = atom('')
 
-// Fan-out state: `profiles` from /profiles, `results[name]` as each profile answers,
+// Fan-out state: `profiles` from the host profile list, `results[name]` as each profile answers,
 // so a fast profile renders while a slow one is still pending.
 const $fanout = atom({ profiles: null, results: {} })
 
@@ -156,6 +156,15 @@ function pct(value) {
 function usd(value) {
   if (value === null || value === undefined) return null
   return `$${Number(value).toFixed(2)}`
+}
+
+/** A key's spend cap. OpenRouter's `limit: null` is unlimited; `0` is a real $0 cap. */
+export function openRouterKeyLabel(key) {
+  const capped = key.restricted || (key.limit_usd !== null && key.limit_usd !== undefined)
+  if (!capped) return 'unrestricted key (no spend limit)'
+  if (key.limit_usd === null || key.limit_usd === undefined) return 'restricted key'
+  const left = key.limit_remaining_usd === null || key.limit_remaining_usd === undefined ? '' : `, ${usd(key.limit_remaining_usd)} left`
+  return `restricted key · ${usd(key.limit_usd)} cap${left}`
 }
 
 function toneFor(remaining) {
@@ -267,11 +276,22 @@ function usagePath(profile, refresh) {
   return `/usage?${params.join('&')}`
 }
 
-async function loadAllAccounts() {
+/** Every installed profile, read through the host's own profile list so it does not depend on
+ *  the app's selected profile having this plugin enabled. Each profile's /usage call below is
+ *  still routed to that profile, so its own plugin gate and consent apply. */
+async function listProfiles() {
+  const listing = host.profiles?.list ? await host.profiles.list() : await rest('/profiles')
+  const rows = Array.isArray(listing?.profiles) ? listing.profiles : []
+  return rows
+    .filter(row => row && typeof row.name === 'string' && row.name)
+    .map(row => ({ name: row.name, is_default: Boolean(row.is_default) }))
+    .sort((a, b) => Number(b.is_default) - Number(a.is_default) || a.name.localeCompare(b.name))
+}
+
+export async function loadAllAccounts() {
   const refresh = pendingRefresh
   pendingRefresh = false
-  const listing = await rest('/profiles')
-  const profiles = Array.isArray(listing?.profiles) ? listing.profiles : []
+  const profiles = await listProfiles()
   const names = profiles.map(row => row.name)
   // Keep the last answer of every still-listed profile until its new one lands.
   const previous = $fanout.get().results
@@ -288,7 +308,7 @@ async function loadAllAccounts() {
       $fanout.set({ ...current, results: { ...current.results, [name]: result } })
     })
   )
-  return { at: new Date().toISOString(), profiles: names.length }
+  return { at: new Date().toISOString(), profiles: names.length, results: $fanout.get().results }
 }
 
 function useAllAccounts(intervalMs) {
@@ -363,7 +383,7 @@ function OpenRouterBlock({ quota }) {
   const key = quota.key
   const keyParts = []
   if (key) {
-    keyParts.push(key.restricted ? 'restricted key' : 'unrestricted key (no spend limit)')
+    keyParts.push(openRouterKeyLabel(key))
     if (key.usage_usd !== null && key.usage_usd !== undefined) keyParts.push(`spent ${usd(key.usage_usd)} total`)
     for (const [field, label] of [['usage_daily_usd', 'today'], ['usage_weekly_usd', 'this week'], ['usage_monthly_usd', 'this month']]) {
       if (key[field]) keyParts.push(`${usd(key[field])} ${label}`)

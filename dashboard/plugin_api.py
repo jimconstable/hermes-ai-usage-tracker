@@ -438,7 +438,8 @@ def _probe_openrouter(source: str) -> dict[str, Any]:
     limit, limit_remaining = _usd(key_data.get("limit")), _usd(key_data.get("limit_remaining"))
     reset = str(key_data.get("limit_reset") or "").strip() or None
     key_info = {
-        "restricted": bool(limit and limit > 0),
+        # OpenRouter documents null as unlimited; 0 is a real $0 cap.
+        "restricted": limit is not None,
         "limit_usd": limit,
         "limit_remaining_usd": limit_remaining,
         "limit_reset": reset,
@@ -448,8 +449,9 @@ def _probe_openrouter(source: str) -> dict[str, Any]:
         "usage_monthly_usd": _usd(key_data.get("usage_monthly")),
     }
     windows = []
-    if limit and limit > 0 and limit_remaining is not None and 0 <= limit_remaining <= limit:
-        windows.append(_window("Key spend limit", (limit - limit_remaining) / limit * 100.0, None,
+    if limit is not None and limit_remaining is not None and 0 <= limit_remaining <= limit:
+        used = (limit - limit_remaining) / limit * 100.0 if limit > 0 else 100.0
+        windows.append(_window("Key spend limit", used, None,
                                f"${limit_remaining:,.2f} of ${limit:,.2f} left" + (f" · resets {reset}" if reset else "")))
     details = [f"Key details unavailable: {key_error}"] if key_error else []
     return {"available": True, "source": "openrouter_api", "title": "OpenRouter", "plan": None,

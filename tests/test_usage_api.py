@@ -189,6 +189,26 @@ def test_openrouter_balance_failure_keeps_key_usage(hermes, client, fake_openrou
     assert quota["key"]["usage_usd"] == 3.0
 
 
+def test_zero_dollar_key_cap_is_restricted_not_unlimited(hermes, client, fake_openrouter):
+    # OpenRouter: limit=null means unlimited; limit=0 is a real $0 cap.
+    caps = {"k-null": None, "k-zero": 0, "k-five": 5.0}
+    fake_openrouter({k: {"credits": {"total_credits": 10.0, "total_usage": 1.0},
+                         "key": {"limit": cap, "limit_remaining": cap, "usage": 0.0}} for k, cap in caps.items()})
+    for name, key in zip(("default", "research", "background"), caps):
+        hermes.add(FakeProfile(name, keys={"openrouter": key}, logged_in={"openrouter"}))
+
+    unlimited, zero, five = (provider(usage(client, n), "openrouter")["quota"]
+                             for n in ("default", "research", "background"))
+
+    assert unlimited["key"]["restricted"] is False and unlimited["windows"] == []
+    assert zero["key"]["restricted"] is True
+    assert (zero["key"]["limit_usd"], zero["key"]["limit_remaining_usd"]) == (0.0, 0.0)
+    assert [(w["label"], w["remaining_percent"], w["detail"]) for w in zero["windows"]] == [
+        ("Key spend limit", 0.0, "$0.00 of $0.00 left")]
+    assert zero["balance"]["remaining_usd"] == 9.0  # account balance stays separate from the key cap
+    assert five["key"]["restricted"] is True and five["windows"][0]["remaining_percent"] == 100.0
+
+
 # ------------------------------------------------------------------ request secret scope
 
 

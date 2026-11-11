@@ -35,6 +35,8 @@ if _armed():
                                        {"limit": 5.0, "limit_remaining": 3.75, "usage": 1.25, "limit_reset": "monthly"}),
             "sk-or-FIXTURE-research": ({"total_credits": 8.0, "total_usage": 7.2},
                                        {"limit": None, "usage": 7.2, "usage_weekly": 1.9}),
+            "FIXTURE-or-zero-cap": ({"total_credits": 8.0, "total_usage": 7.2},
+                                    {"limit": 0, "limit_remaining": 0, "usage": 0}),
         }
         if token not in keys:
             return httpx.Response(401, json={"error": {"message": "FIXTURE: key revoked"}})

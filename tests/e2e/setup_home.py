@@ -6,7 +6,8 @@
 Profiles (every credential is a fake ``FIXTURE`` string; the network shim answers for them):
 
 * default    — Codex account A, OpenRouter main key + ``openrouter-limited`` restricted fallback key
-* background — no login of its own: falls back to the root's Codex account A (shared subscription)
+* background — no login of its own: falls back to the root's Codex account A (shared subscription),
+               plus an OpenRouter key with a $0 spend cap (a cap, not "unlimited")
 * sweep      — Codex account B (a distinct account: must stay a separate card)
 * research   — its own OpenRouter key (a distinct key: never merged with default's)
 * sooty      — Claude Subscription DirectSDK via the fake ``claude`` CLI, plus a revoked OpenRouter
@@ -86,7 +87,8 @@ def main() -> int:
                             "OPENROUTER_FALLBACK_API_KEY": "sk-or-FIXTURE-fallback"},
                     "auth": codex_auth("acct-A-FIXTURE", "user-A-FIXTURE")},
         "background": {"config": {"model": {"provider": "openai-codex", "default": "gpt-5"},
-                                  "plugins": {"enabled": tracker}}},
+                                  "plugins": {"enabled": tracker}},
+                       "env": {"OPENROUTER_API_KEY": "FIXTURE-or-zero-cap"}},
         "sweep": {"config": {"model": {"provider": "openai-codex", "default": "gpt-5"},
                              "plugins": {"enabled": tracker}},
                   "auth": codex_auth("acct-B-FIXTURE", "user-B-FIXTURE")},

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 const plugin = await import('../../desktop/plugin.js')
-const { aggregateAccounts, filterAccounts, formatLocalTime } = plugin
+const { aggregateAccounts, filterAccounts, formatLocalTime, loadAllAccounts, openRouterKeyLabel } = plugin
+const { host } = await import('@hermes/plugin-sdk')
 
 const codex = (fingerprint, used = 40, fetched = '2026-11-11T09:00:00+00:00') => ({
   id: 'openai-codex',
@@ -118,4 +119,36 @@ test('timestamps render in the browser-local time zone, not a hardcoded one', ()
   } finally {
     process.env.TZ = original
   }
+})
+
+test('the selected profile refusing /profiles cannot stop the other profiles from refreshing', async () => {
+  // App on `legacy`, where this plugin is not enabled: its routed /profiles and /usage 404.
+  globalThis.__activeProfile = 'legacy'
+  host.profiles = { list: async () => ({ profiles: [{ name: 'default', is_default: true }, { name: 'legacy' }, { name: 'sooty' }] }) }
+  const calls = []
+  const rest = async path => {
+    calls.push(path)
+    if (path === '/profiles' || path.includes('profile=legacy')) throw new Error('404: {"detail":"Plugin not found"}')
+    return { generated_at: '2026-11-11T09:00:00Z', providers: [codex('fp-shared')] }
+  }
+  try {
+    plugin.default.register({ rest, storage: { get: (_k, fallback) => fallback, set: () => {} }, register: () => {} })
+    const { results } = await loadAllAccounts()
+
+    assert.ok(!calls.includes('/profiles'))
+    assert.equal(results.default.ok, true)
+    assert.equal(results.sooty.ok, true)
+    assert.equal(results.legacy.ok, false) // its own plugin gate still applies, reported per profile
+    const { accounts } = aggregateAccounts(Object.values(results))
+    assert.deepEqual(accounts[0].profiles, ['default', 'sooty'])
+  } finally {
+    delete host.profiles
+    delete globalThis.__activeProfile
+  }
+})
+
+test('an OpenRouter $0 key cap is shown as a cap, not as an unrestricted key', () => {
+  assert.equal(openRouterKeyLabel({ restricted: false, limit_usd: null }), 'unrestricted key (no spend limit)')
+  assert.equal(openRouterKeyLabel({ restricted: true, limit_usd: 0, limit_remaining_usd: 0 }), 'restricted key · $0.00 cap, $0.00 left')
+  assert.equal(openRouterKeyLabel({ restricted: true, limit_usd: 5, limit_remaining_usd: 4 }), 'restricted key · $5.00 cap, $4.00 left')
 })
