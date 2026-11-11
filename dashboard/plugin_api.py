@@ -24,6 +24,7 @@ provider itself confirms (a Codex JWT principal, an OpenRouter API key), or
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import logging
 import os
@@ -107,7 +108,7 @@ def _run_in_home(home: Optional[Path], fn: Callable[[], Any]) -> Any:
     The override lives in a ContextVar, so it is thread-local: a request can
     resolve another profile's credentials/state without disturbing the server's
     own profile (and ThreadPoolExecutor workers do NOT inherit the caller's
-    context, so every worker binds it itself).
+    context, so every worker runs in a copy of it and binds the home itself).
     """
     if home is None:
         return fn()
@@ -467,7 +468,7 @@ def _probe_nous() -> dict[str, Any]:
         return get_nous_portal_account_info(force_fresh=True)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        info = pool.submit(_fetch).result(timeout=_PROBE_TIMEOUT)
+        info = pool.submit(contextvars.copy_context().run, _fetch).result(timeout=_PROBE_TIMEOUT)
     snapshot = build_nous_credits_snapshot(info)
     if snapshot is None:
         return _unavailable("Not signed in to Nous Portal, or the portal returned no subscription data.",
@@ -834,7 +835,10 @@ def _build_payload(home: Optional[Path], profile_name: Optional[str]) -> dict[st
 
     if candidates:
         with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(candidates))) as pool:
-            futures = {pool.submit(_run_in_home, home, _probe_for(pid)): pid for pid in sorted(candidates)}
+            # Workers don't inherit the request's ContextVars; each gets a copy so the secret scope
+            # Hermes bound for this request still applies (it fails closed without one).
+            futures = {pool.submit(contextvars.copy_context().run, _run_in_home, home, _probe_for(pid)): pid
+                       for pid in sorted(candidates)}
             for future in as_completed(futures):
                 pid = futures[future]
                 try:

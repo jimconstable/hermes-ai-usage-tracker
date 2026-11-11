@@ -189,6 +189,24 @@ def test_openrouter_balance_failure_keeps_key_usage(hermes, client, fake_openrou
     assert quota["key"]["usage_usd"] == 3.0
 
 
+# ------------------------------------------------------------------ request secret scope
+
+
+def test_probe_workers_keep_the_requests_secret_scope(hermes, client, fake_openrouter):
+    """Once Hermes serves several profiles it fails closed on credential reads outside the
+    request's bound secret scope; the probe thread pool must carry that scope along."""
+    hermes.fail_closed = True
+    key = "sk-or-scope-SECRET"
+    fake_openrouter({key: {"credits": {"total_credits": 3.0, "total_usage": 1.0}, "key": {"usage": 1.0}}})
+    hermes.add(FakeProfile("default", keys={"openrouter": key}, logged_in={"openrouter", "openai-codex"},
+                           usage={"openai-codex": codex_snapshot()}))
+
+    payload = usage(client, "default")
+
+    assert provider(payload, "openrouter")["quota"]["available"] is True
+    assert provider(payload, "openai-codex")["quota"]["available"] is True
+
+
 # ------------------------------------------------------------------ partial failure
 
 

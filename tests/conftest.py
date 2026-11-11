@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 REPO = Path(__file__).resolve().parents[1]
@@ -73,7 +73,14 @@ class FakeHermes:
         self.home_var: contextvars.ContextVar = contextvars.ContextVar("fake_home", default=None)
         self.usage_calls: list[tuple[str, str]] = []  # (bound profile name, provider)
         self.native_profiles: dict[str, Any] = {}  # provider id -> object with display_name
-        self.openrouter_http: Callable | None = None
+        # Hermes binds each plugin request's secret scope in a ContextVar (route dependency);
+        # with multi-profile hosting on, any credential read outside it fails closed.
+        self.secret_scope: contextvars.ContextVar = contextvars.ContextVar("fake_secret_scope", default=None)
+        self.fail_closed = False
+
+    def check_scope(self) -> None:
+        if self.fail_closed and self.secret_scope.get() is None:
+            raise RuntimeError("UnscopedSecretError: credential read outside the request's secret scope")
 
     # -- profiles -----------------------------------------------------------------------
     def add(self, profile: FakeProfile) -> FakeProfile:
@@ -124,6 +131,7 @@ class FakeHermes:
         runtime_mod = types.ModuleType("hermes_cli.runtime_provider")
 
         def resolve_runtime_provider(requested=None, **_kw):
+            fake.check_scope()
             profile = fake.bound()
             key = profile.keys.get(requested)
             if key is None:
@@ -147,6 +155,7 @@ class FakeHermes:
         account_usage = types.ModuleType("agent.account_usage")
 
         def fetch_account_usage(provider, **_kw):
+            fake.check_scope()
             profile = fake.bound()
             fake.usage_calls.append((profile.name, provider))
             behaviour = profile.usage.get(provider)
@@ -193,9 +202,17 @@ def backend(hermes, monkeypatch):
 
 
 @pytest.fixture
-def client(backend):
+def client(backend, hermes):
+    async def secret_scope():
+        # Like Hermes' plugin route dependency: async, so sync handlers inherit the bound scope.
+        token = hermes.secret_scope.set("request-scope")
+        try:
+            yield
+        finally:
+            hermes.secret_scope.reset(token)
+
     app = FastAPI()
-    app.include_router(backend.router, prefix="/api/plugins/ai-usage-tracker")
+    app.include_router(backend.router, prefix="/api/plugins/ai-usage-tracker", dependencies=[Depends(secret_scope)])
     return TestClient(app)
 
 

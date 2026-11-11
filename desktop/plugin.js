@@ -470,7 +470,7 @@ function FilterPicker({ profiles, value, onSelect }) {
         children: [
           jsx(SelectItem, { value: ALL_ACCOUNTS, children: 'All accounts' }, ALL_ACCOUNTS),
           ...profiles.map(row =>
-            jsx(SelectItem, { value: row.name, children: `${row.name}${row.is_default ? ' · default' : ''}` }, row.name)
+            jsx(SelectItem, { value: row.name, children: row.is_default && row.name !== 'default' ? `${row.name} (default)` : row.name }, row.name)
           )
         ]
       })
